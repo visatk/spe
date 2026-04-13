@@ -1,0 +1,49 @@
+{
+  "compilerOptions": {
+    /* Base Options: Optimized for Cloudflare Workers V8 Engine */
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022", "ESNext.Disposable"],
+    "types": [
+      "./worker-configuration.d.ts",
+      "node"
+    ],
+    
+    /* Bundler Mode: Wrangler 4 uses an upgraded esbuild v0.24+ */
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    
+    /* Strict Type-Checking Options */
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictBindCallApply": true,
+    "strictPropertyInitialization": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+    
+    /* Linter Checks for Edge Reliability */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    
+    /* Advanced Compiler Options */
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "worker-configuration.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".wrangler"
+  ]
+}
