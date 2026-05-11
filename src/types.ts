@@ -5,8 +5,9 @@ export interface Env {
     UPSTREAM_TIMEOUT_MS: string;
     TELEGRAM_BOT_TOKEN: string;
     TELEGRAM_WEBHOOK_SECRET: string;
-    ADMIN_TELEGRAM_ID: string; // The master admin ID
-    KV: KVNamespace; // Cloudflare KV Binding
+    ADMIN_TELEGRAM_ID: string;
+    DAILY_CARD_LIMIT: string; // Dynamic Quota Configuration
+    KV: KVNamespace;
   };
 }
 
@@ -21,14 +22,12 @@ export interface UpstreamResponse {
   raw?: any;
 }
 
-// KV Storage Typings
 export interface UserRecord {
   role: 'admin' | 'user';
   addedAt: number;
   addedBy: number;
 }
 
-// Telegram Webhook Typings
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
