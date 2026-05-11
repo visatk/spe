@@ -6,7 +6,7 @@ export interface Env {
     TELEGRAM_BOT_TOKEN: string;
     TELEGRAM_WEBHOOK_SECRET: string;
     ADMIN_TELEGRAM_ID: string;
-    DAILY_CARD_LIMIT: string; // Dynamic Quota Configuration
+    DAILY_CARD_LIMIT: string;
     KV: KVNamespace;
   };
 }
@@ -17,9 +17,9 @@ export interface CheckPayload {
 }
 
 export interface UpstreamResponse {
+  card: string;
   status: 'live' | 'dead' | 'unknown';
   message: string;
-  raw?: any;
 }
 
 export interface UserRecord {
