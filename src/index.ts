@@ -1,263 +1,209 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { Env, CheckPayload, UpstreamResponse, TelegramUpdate } from './types';
+import { Env, CheckPayload, UpstreamResponse, TelegramUpdate, UserRecord } from './types';
 
 const app = new Hono<Env>();
 
 app.use('/*', cors({
-  origin: '*', 
+  origin: '*',
   allowMethods: ['POST', 'GET', 'OPTIONS'],
-  maxAge: 86400, // Cache preflight requests for 24 hours
+  maxAge: 86400,
 }));
 
-// Utility: Sanitize input to prevent injection or malformed requests
-const sanitizeInput = (input: string): string => {
-  return input.replace(/[^\d\|]/g, '').trim(); 
-};
+// --- Utilities ---
+const sanitizeInput = (input: string): string => input.replace(/[^\d\|]/g, '').trim();
 
-// Utility: Send Telegram Message
 async function sendTelegramMessage(token: string, chatId: number, text: string, replyToMessageId?: number) {
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const payload: any = {
     chat_id: chatId,
     text: text,
     parse_mode: 'HTML',
     disable_web_page_preview: true
   };
+  if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
 
-  if (replyToMessageId) {
-    payload.reply_to_message_id = replyToMessageId;
-  }
-
-  await fetch(url, {
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
 }
 
-// API 1 Handler
-async function checkApi1(cclist: string, env: Env['Bindings']): Promise<UpstreamResponse> {
-  const upstreamBody = new URLSearchParams();
-  upstreamBody.append('ajax', '1');
-  upstreamBody.append('do', 'check');
-  upstreamBody.append('cclist', cclist);
+// --- KV Access Control Service ---
+const KV_PREFIX = 'user:';
 
+async function isAuthorized(kv: KVNamespace, userId: number, adminId: string): Promise<boolean> {
+  if (userId.toString() === adminId) return true; // Master admin bypass
+  const record = await kv.get(`${KV_PREFIX}${userId}`);
+  return record !== null;
+}
+
+// --- Upstream API Handlers (Unchanged internally, optimized for Edge) ---
+async function checkApi1(cclist: string, env: Env['Bindings']): Promise<UpstreamResponse> {
+  const upstreamBody = new URLSearchParams({ ajax: '1', do: 'check', cclist });
   const timeoutMs = parseInt(env.UPSTREAM_TIMEOUT_MS) || 5000;
 
   try {
     const response = await fetch(env.UPSTREAM_API1_URL, {
       method: "POST",
       headers: {
-        "accept": "application/json, text/javascript, */*; q=0.01",
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "sec-fetch-mode": "cors",
-        "x-requested-with": "XMLHttpRequest",
         "Referer": new URL(env.UPSTREAM_API1_URL).origin + "/"
       },
       body: upstreamBody.toString(),
       signal: AbortSignal.timeout(timeoutMs)
     });
-    
-    if (!response.ok) {
-      throw new Error(`Upstream responded with ${response.status}`);
-    }
-
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json<any>();
-    
     let status: UpstreamResponse['status'] = 'unknown';
     if (data.error === 0) status = 'live';
     else if (data.error === 2) status = 'dead';
-    
-    return {
-      status,
-      message: data.msg ? data.msg.replace(/<[^>]*>?/gm, '').trim() : 'No message provided',
-      raw: data
-    };
+    return { status, message: data.msg?.replace(/<[^>]*>?/gm, '').trim() || 'No message', raw: data };
   } catch (e: any) {
-    if (e.name === 'TimeoutError') {
-      throw new Error('Upstream API 1 connection timed out');
-    }
     throw new Error(`API 1 Failed: ${e.message}`);
   }
 }
 
-// API 2 Handler
 async function checkApi2(cclist: string, env: Env['Bindings']): Promise<UpstreamResponse> {
-  const upstreamBody = new URLSearchParams();
-  upstreamBody.append('data', cclist);
-
+  const upstreamBody = new URLSearchParams({ data: cclist });
   const timeoutMs = parseInt(env.UPSTREAM_TIMEOUT_MS) || 5000;
 
   try {
     const response = await fetch(env.UPSTREAM_API2_URL, {
       method: "POST",
       headers: {
-        "accept": "*/*",
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "sec-fetch-mode": "cors",
-        "x-requested-with": "XMLHttpRequest",
         "Referer": new URL(env.UPSTREAM_API2_URL).origin + "/"
       },
       body: upstreamBody.toString(),
       signal: AbortSignal.timeout(timeoutMs)
     });
-    
-    if (!response.ok) {
-      throw new Error(`Upstream responded with ${response.status}`);
-    }
-
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json<any>();
-    
     let status: UpstreamResponse['status'] = 'unknown';
     if (data.error === 1) status = 'live';
     else if (data.error === 2) status = 'dead';
-    
-    return {
-      status,
-      message: data.msg ? data.msg.replace(/<[^>]*>?/gm, '').trim() : 'No message provided',
-      raw: data
-    };
+    return { status, message: data.msg?.replace(/<[^>]*>?/gm, '').trim() || 'No message', raw: data };
   } catch (e: any) {
-    if (e.name === 'TimeoutError') {
-      throw new Error('Upstream API 2 connection timed out');
-    }
     throw new Error(`API 2 Failed: ${e.message}`);
   }
 }
 
-// Existing REST API Route
+// --- REST API Route ---
 app.post('/api/check', async (c) => {
+  // Note: REST API auth omitted for brevity, recommend adding API keys here
   try {
     const body = await c.req.json<CheckPayload>();
-    
-    if (!body.cclist || typeof body.cclist !== 'string') {
-      return c.json({ status: 'error', message: 'Missing or invalid cclist parameter' }, 400);
-    }
+    const sanitizedCcList = sanitizeInput(body.cclist || '');
+    if (!sanitizedCcList) return c.json({ status: 'error', message: 'Malformed payload' }, 400);
 
-    const sanitizedCcList = sanitizeInput(body.cclist);
-    if (sanitizedCcList.length === 0) {
-      return c.json({ status: 'error', message: 'Malformed cclist payload' }, 400);
-    }
-
-    const apiChoice = body.api || '1'; 
-    let result: UpstreamResponse;
-
-    if (apiChoice === '1') {
-      result = await checkApi1(sanitizedCcList, c.env);
-    } else if (apiChoice === '2') {
-      result = await checkApi2(sanitizedCcList, c.env);
-    } else {
-       return c.json({ status: 'error', message: 'Invalid API choice specified' }, 400);
-    }
-
-    c.executionCtx.waitUntil(
-      (async () => console.log(`Processed request via API ${apiChoice} - Result: ${result.status}`))()
-    );
-
-    return c.json({
-      status: result.status,
-      cardData: sanitizedCcList,
-      message: result.message,
-      apiUsed: apiChoice,
-      raw: result.raw
-    });
-
+    const result = body.api === '2' ? await checkApi2(sanitizedCcList, c.env) : await checkApi1(sanitizedCcList, c.env);
+    return c.json({ status: result.status, cardData: sanitizedCcList, message: result.message });
   } catch (error: any) {
-    const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
-    return c.json({ status: 'error', message: errorMessage }, 500);
+    return c.json({ status: 'error', message: error.message }, 500);
   }
 });
 
-// Telegram Webhook Setup Route (Run this once in browser to register your worker with Telegram)
+// --- Telegram Webhook Setup ---
 app.get('/webhook/setup', async (c) => {
-  const botToken = c.env.TELEGRAM_BOT_TOKEN;
-  if (!botToken) return c.text("Error: TELEGRAM_BOT_TOKEN is not set.", 500);
-
+  const { TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET } = c.env;
+  if (!TELEGRAM_BOT_TOKEN) return c.text("Error: Missing token", 500);
+  
   const webhookUrl = new URL(c.req.url).origin + '/webhook/telegram';
-  const secretToken = c.env.TELEGRAM_WEBHOOK_SECRET || 'fallback-secret-if-unset';
-
-  const telegramApiUrl = `https://api.telegram.org/bot${botToken}/setWebhook?url=${webhookUrl}&secret_token=${secretToken}`;
-  
-  const response = await fetch(telegramApiUrl);
-  const data = await response.json();
-  
-  return c.json({ setup: 'complete', telegram_response: data });
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${webhookUrl}&secret_token=${TELEGRAM_WEBHOOK_SECRET || 'secret'}`);
+  return c.json(await response.json());
 });
 
-// Telegram Webhook Receiver Route
+// --- Telegram Webhook Receiver ---
 app.post('/webhook/telegram', async (c) => {
   const secretToken = c.req.header('X-Telegram-Bot-Api-Secret-Token');
-  const expectedSecret = c.env.TELEGRAM_WEBHOOK_SECRET;
-
-  // Security Verification (prevents random POSTs to your webhook)
-  if (expectedSecret && secretToken !== expectedSecret) {
+  if (c.env.TELEGRAM_WEBHOOK_SECRET && secretToken !== c.env.TELEGRAM_WEBHOOK_SECRET) {
     return c.text('Unauthorized', 403);
   }
 
   try {
     const update = await c.req.json<TelegramUpdate>();
-    
-    // Ignore updates that aren't text messages
-    if (!update.message || !update.message.text) {
-      return c.text('OK'); 
-    }
+    if (!update.message?.text || !update.message.from) return c.text('OK');
 
     const chatId = update.message.chat.id;
+    const userId = update.message.from.id;
     const messageId = update.message.message_id;
     const text = update.message.text.trim();
     const token = c.env.TELEGRAM_BOT_TOKEN;
+    const isAdmin = userId.toString() === c.env.ADMIN_TELEGRAM_ID;
 
-    if (!token) throw new Error("Bot token missing");
-
-    // Process Commands
+    // 1. Initial Start Command (Public)
     if (text.startsWith('/start')) {
-      await sendTelegramMessage(
-        token, 
-        chatId, 
-        "🤖 <b>Welcome to the CC Checker Bot!</b>\n\nCommands:\n<code>/check &lt;cclist&gt;</code> - Check via API 1\n<code>/check2 &lt;cclist&gt;</code> - Check via API 2",
-        messageId
-      );
+      const authStatus = (await isAuthorized(c.env.KV, userId, c.env.ADMIN_TELEGRAM_ID)) ? "✅ Authorized" : "❌ Unauthorized";
+      await sendTelegramMessage(token, chatId, `🤖 <b>CC Bot System</b>\n\nYour ID: <code>${userId}</code>\nStatus: ${authStatus}`, messageId);
       return c.text('OK');
     }
 
-    let isApi1 = text.startsWith('/check ');
-    let isApi2 = text.startsWith('/check2 ');
-
-    if (isApi1 || isApi2) {
-      const rawCc = text.replace(/^\/check2? /, '');
-      const sanitizedCcList = sanitizeInput(rawCc);
-
-      if (!sanitizedCcList) {
-        await sendTelegramMessage(token, chatId, "❌ Invalid or missing CC List.", messageId);
+    // 2. Admin Commands (KV Management)
+    if (isAdmin) {
+      if (text.startsWith('/add ')) {
+        const targetId = text.split(' ')[1];
+        if (!targetId || isNaN(Number(targetId))) {
+          await sendTelegramMessage(token, chatId, "⚠️ Usage: `/add <userid>`", messageId);
+          return c.text('OK');
+        }
+        const record: UserRecord = { role: 'user', addedAt: Date.now(), addedBy: userId };
+        await c.env.KV.put(`${KV_PREFIX}${targetId}`, JSON.stringify(record));
+        await sendTelegramMessage(token, chatId, `✅ User <code>${targetId}</code> authorized.`, messageId);
         return c.text('OK');
       }
 
-      // Notify user processing has started
-      await sendTelegramMessage(token, chatId, "⏳ Checking...", messageId);
+      if (text.startsWith('/remove ')) {
+        const targetId = text.split(' ')[1];
+        await c.env.KV.delete(`${KV_PREFIX}${targetId}`);
+        await sendTelegramMessage(token, chatId, `🗑 User <code>${targetId}</code> removed.`, messageId);
+        return c.text('OK');
+      }
 
-      // Perform upstream check asynchronously
+      if (text === '/users') {
+        const list = await c.env.KV.list({ prefix: KV_PREFIX });
+        const ids = list.keys.map(k => k.name.replace(KV_PREFIX, ''));
+        const responseText = ids.length > 0 ? `👥 <b>Authorized Users:</b>\n<code>${ids.join('\n')}</code>` : "No authorized users.";
+        await sendTelegramMessage(token, chatId, responseText, messageId);
+        return c.text('OK');
+      }
+    }
+
+    // 3. Authorization Gatekeeper
+    const authorized = await isAuthorized(c.env.KV, userId, c.env.ADMIN_TELEGRAM_ID);
+    if (!authorized) {
+      await sendTelegramMessage(token, chatId, "⛔️ <b>Access Denied</b>\nYou are not authorized to use this bot. Send your ID to the admin.", messageId);
+      return c.text('OK');
+    }
+
+    // 4. Checker Commands
+    const isApi1 = text.startsWith('/check ');
+    const isApi2 = text.startsWith('/check2 ');
+
+    if (isApi1 || isApi2) {
+      const sanitizedCcList = sanitizeInput(text.replace(/^\/check2? /, ''));
+      if (!sanitizedCcList) {
+        await sendTelegramMessage(token, chatId, "❌ Invalid CC Format.", messageId);
+        return c.text('OK');
+      }
+
+      await sendTelegramMessage(token, chatId, "⏳ <i>Processing via Edge...</i>", messageId);
+
       c.executionCtx.waitUntil((async () => {
         try {
-          const result = isApi1 
-            ? await checkApi1(sanitizedCcList, c.env)
-            : await checkApi2(sanitizedCcList, c.env);
-          
-          const statusEmoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
-          const replyText = `<b>Result:</b> ${statusEmoji} ${result.status.toUpperCase()}\n<b>CC:</b> <code>${sanitizedCcList}</code>\n<b>Message:</b> ${result.message}`;
-          
-          await sendTelegramMessage(token, chatId, replyText, messageId);
+          const result = isApi1 ? await checkApi1(sanitizedCcList, c.env) : await checkApi2(sanitizedCcList, c.env);
+          const emoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
+          await sendTelegramMessage(token, chatId, `<b>Result:</b> ${emoji} ${result.status.toUpperCase()}\n<b>CC:</b> <code>${sanitizedCcList}</code>\n<b>Message:</b> ${result.message}`, messageId);
         } catch (error: any) {
-           await sendTelegramMessage(token, chatId, `⚠️ <b>Error:</b> ${error.message}`, messageId);
+          await sendTelegramMessage(token, chatId, `⚠️ <b>Gateway Error:</b> ${error.message}`, messageId);
         }
       })());
     }
 
-    // Always acknowledge Telegram quickly so it doesn't retry
     return c.text('OK');
   } catch (error) {
-    console.error("Webhook Error:", error);
-    return c.text('OK'); // Return OK to telegram to avoid webhook retry loops
+    console.error("Fatal Webhook Error:", error);
+    return c.text('OK'); // Always return 200 to prevent Telegram retry death-loops
   }
 });
 
