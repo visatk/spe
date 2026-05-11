@@ -11,3 +11,7 @@ mode = "smart"
 UPSTREAM_API1_URL = "https://wallet.payate.com/card/ccn1/alien07.php"
 UPSTREAM_API2_URL = "https://mock.payate.com/api.php"
 UPSTREAM_TIMEOUT_MS = "5000"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "bb8ef261cab04944973a633c28673def"
