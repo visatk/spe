@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { Env, CheckPayload, UpstreamResponse } from './types';
+import { Env, CheckPayload, UpstreamResponse, TelegramUpdate } from './types';
 
 const app = new Hono<Env>();
 
@@ -14,6 +14,27 @@ app.use('/*', cors({
 const sanitizeInput = (input: string): string => {
   return input.replace(/[^\d\|]/g, '').trim(); 
 };
+
+// Utility: Send Telegram Message
+async function sendTelegramMessage(token: string, chatId: number, text: string, replyToMessageId?: number) {
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const payload: any = {
+    chat_id: chatId,
+    text: text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true
+  };
+
+  if (replyToMessageId) {
+    payload.reply_to_message_id = replyToMessageId;
+  }
+
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
 
 // API 1 Handler
 async function checkApi1(cclist: string, env: Env['Bindings']): Promise<UpstreamResponse> {
@@ -105,7 +126,7 @@ async function checkApi2(cclist: string, env: Env['Bindings']): Promise<Upstream
   }
 }
 
-// Main Route
+// Existing REST API Route
 app.post('/api/check', async (c) => {
   try {
     const body = await c.req.json<CheckPayload>();
@@ -130,26 +151,113 @@ app.post('/api/check', async (c) => {
        return c.json({ status: 'error', message: 'Invalid API choice specified' }, 400);
     }
 
-    // Asynchronous logging example: Does not block the HTTP response
     c.executionCtx.waitUntil(
-      (async () => {
-        // e.g., await logToAnalytics(apiChoice, result.status);
-        console.log(`Processed request via API ${apiChoice} - Result: ${result.status}`);
-      })()
+      (async () => console.log(`Processed request via API ${apiChoice} - Result: ${result.status}`))()
     );
 
     return c.json({
       status: result.status,
-      cardData: sanitizedCcList, // Return sanitized version
+      cardData: sanitizedCcList,
       message: result.message,
       apiUsed: apiChoice,
       raw: result.raw
     });
 
   } catch (error: any) {
-    // Prevent leaking internal stack traces to the client
     const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
     return c.json({ status: 'error', message: errorMessage }, 500);
+  }
+});
+
+// Telegram Webhook Setup Route (Run this once in browser to register your worker with Telegram)
+app.get('/webhook/setup', async (c) => {
+  const botToken = c.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) return c.text("Error: TELEGRAM_BOT_TOKEN is not set.", 500);
+
+  const webhookUrl = new URL(c.req.url).origin + '/webhook/telegram';
+  const secretToken = c.env.TELEGRAM_WEBHOOK_SECRET || 'fallback-secret-if-unset';
+
+  const telegramApiUrl = `https://api.telegram.org/bot${botToken}/setWebhook?url=${webhookUrl}&secret_token=${secretToken}`;
+  
+  const response = await fetch(telegramApiUrl);
+  const data = await response.json();
+  
+  return c.json({ setup: 'complete', telegram_response: data });
+});
+
+// Telegram Webhook Receiver Route
+app.post('/webhook/telegram', async (c) => {
+  const secretToken = c.req.header('X-Telegram-Bot-Api-Secret-Token');
+  const expectedSecret = c.env.TELEGRAM_WEBHOOK_SECRET;
+
+  // Security Verification (prevents random POSTs to your webhook)
+  if (expectedSecret && secretToken !== expectedSecret) {
+    return c.text('Unauthorized', 403);
+  }
+
+  try {
+    const update = await c.req.json<TelegramUpdate>();
+    
+    // Ignore updates that aren't text messages
+    if (!update.message || !update.message.text) {
+      return c.text('OK'); 
+    }
+
+    const chatId = update.message.chat.id;
+    const messageId = update.message.message_id;
+    const text = update.message.text.trim();
+    const token = c.env.TELEGRAM_BOT_TOKEN;
+
+    if (!token) throw new Error("Bot token missing");
+
+    // Process Commands
+    if (text.startsWith('/start')) {
+      await sendTelegramMessage(
+        token, 
+        chatId, 
+        "🤖 <b>Welcome to the CC Checker Bot!</b>\n\nCommands:\n<code>/check &lt;cclist&gt;</code> - Check via API 1\n<code>/check2 &lt;cclist&gt;</code> - Check via API 2",
+        messageId
+      );
+      return c.text('OK');
+    }
+
+    let isApi1 = text.startsWith('/check ');
+    let isApi2 = text.startsWith('/check2 ');
+
+    if (isApi1 || isApi2) {
+      const rawCc = text.replace(/^\/check2? /, '');
+      const sanitizedCcList = sanitizeInput(rawCc);
+
+      if (!sanitizedCcList) {
+        await sendTelegramMessage(token, chatId, "❌ Invalid or missing CC List.", messageId);
+        return c.text('OK');
+      }
+
+      // Notify user processing has started
+      await sendTelegramMessage(token, chatId, "⏳ Checking...", messageId);
+
+      // Perform upstream check asynchronously
+      c.executionCtx.waitUntil((async () => {
+        try {
+          const result = isApi1 
+            ? await checkApi1(sanitizedCcList, c.env)
+            : await checkApi2(sanitizedCcList, c.env);
+          
+          const statusEmoji = result.status === 'live' ? '✅' : result.status === 'dead' ? '❌' : '⚠️';
+          const replyText = `<b>Result:</b> ${statusEmoji} ${result.status.toUpperCase()}\n<b>CC:</b> <code>${sanitizedCcList}</code>\n<b>Message:</b> ${result.message}`;
+          
+          await sendTelegramMessage(token, chatId, replyText, messageId);
+        } catch (error: any) {
+           await sendTelegramMessage(token, chatId, `⚠️ <b>Error:</b> ${error.message}`, messageId);
+        }
+      })());
+    }
+
+    // Always acknowledge Telegram quickly so it doesn't retry
+    return c.text('OK');
+  } catch (error) {
+    console.error("Webhook Error:", error);
+    return c.text('OK'); // Return OK to telegram to avoid webhook retry loops
   }
 });
 
