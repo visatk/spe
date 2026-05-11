@@ -3,8 +3,10 @@ export interface Env {
     UPSTREAM_API1_URL: string;
     UPSTREAM_API2_URL: string;
     UPSTREAM_TIMEOUT_MS: string;
-    TELEGRAM_BOT_TOKEN: string; // Added for the bot
-    TELEGRAM_WEBHOOK_SECRET: string; // Added for security
+    TELEGRAM_BOT_TOKEN: string;
+    TELEGRAM_WEBHOOK_SECRET: string;
+    ADMIN_TELEGRAM_ID: string; // The master admin ID
+    KV: KVNamespace; // Cloudflare KV Binding
   };
 }
 
@@ -17,6 +19,13 @@ export interface UpstreamResponse {
   status: 'live' | 'dead' | 'unknown';
   message: string;
   raw?: any;
+}
+
+// KV Storage Typings
+export interface UserRecord {
+  role: 'admin' | 'user';
+  addedAt: number;
+  addedBy: number;
 }
 
 // Telegram Webhook Typings
