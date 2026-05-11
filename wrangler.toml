@@ -5,3 +5,9 @@ compatibility_date = "2026-04-12"
 
 [placement]
 mode = "smart"
+
+[vars]
+# Injected Environment Variables for Upstream APIs
+UPSTREAM_API1_URL = "https://wallet.payate.com/card/ccn1/alien07.php"
+UPSTREAM_API2_URL = "https://mock.payate.com/api.php"
+UPSTREAM_TIMEOUT_MS = "5000"
