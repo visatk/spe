@@ -8,6 +8,7 @@ export interface Env {
     ADMIN_TELEGRAM_ID: string;
     DAILY_CARD_LIMIT: string;
     KV: KVNamespace;
+    MY_DURABLE_OBJECT: DurableObjectNamespace;
   };
 }
 
@@ -22,12 +23,6 @@ export interface UpstreamResponse {
   message: string;
 }
 
-export interface UserRecord {
-  role: 'admin' | 'user';
-  addedAt: number;
-  addedBy: number;
-}
-
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
@@ -35,16 +30,15 @@ export interface TelegramUpdate {
 
 export interface TelegramMessage {
   message_id: number;
-  from?: {
-    id: number;
-    is_bot: boolean;
-    first_name: string;
-    username?: string;
-  };
-  chat: {
-    id: number;
-    type: 'private' | 'group' | 'supergroup' | 'channel';
-  };
+  from?: { id: number; is_bot: boolean; first_name: string; username?: string; };
+  chat: { id: number; type: 'private' | 'group' | 'supergroup' | 'channel'; };
   date: number;
   text?: string;
+}
+
+// DO RPC Interface for strict TypeScript support
+export interface IMyDurableObject {
+  getRemainingQuota(limit: number): Promise<number>;
+  consumeQuota(cardsToProcess: number, limit: number): Promise<{ allowed: boolean; remaining: number }>;
+  processCardsBatch(validCards: string[], gateName: string, isApi1: boolean, chatId: number, messageId: number, token: string, remainingQuota: number): Promise<void>;
 }
