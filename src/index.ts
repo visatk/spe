@@ -16,7 +16,7 @@ let cachedSessionId: string | null = null;
 async function getFreshSessionId(): Promise<string> {
   const loginBody = new URLSearchParams();
   loginBody.append('mail', 'PAYATE');
-  loginBody.append('pass', 'd');
+  loginBody.append('pass', 'PAYATE');
   loginBody.append('do', 'login');
   loginBody.append('key', '14A9T3MMTTNAR0MA');
 
